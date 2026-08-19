@@ -1,9 +1,12 @@
 const processError = (error) => {
   if (error.name === 'ValidationError') {
+    const firstMessage =
+      Object.values(error.errors)[0]?.message || 'Validation failed';
+
     return {
       statusCode: 400,
-      message: 'Validation failed',
-      data: Object.values(error.errors).map((err) => err.message),
+      message: firstMessage,
+      data: null,
     };
   }
   if (error.code === 11000) {
@@ -13,6 +16,13 @@ const processError = (error) => {
       return {
         statusCode: 409,
         message: 'Email already exists',
+        data: null,
+      };
+    }
+    if (duplicateField === 'mobile') {
+      return {
+        statusCode: 409,
+        message: 'Mobile number already exists',
         data: null,
       };
     }

@@ -38,9 +38,36 @@ const leaveRequestSchema = new mongoose.Schema(
       type: String,
       trim: true,
     },
+    rejectionReason: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+    createdBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+    },
+    updatedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+    },
     approvedBy: {
       type: mongoose.Schema.Types.ObjectId,
-      ref:'User',
+      ref: 'User',
+      default: null,
+    },
+    approvedAt: {
+      type: Date,
+      default: null,
+    },
+    rejectedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+    },
+    rejectedAt: {
+      type: Date,
+      default: null,
     },
   },
   {

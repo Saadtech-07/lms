@@ -4,6 +4,10 @@ const LeaveType = require('../models/LeaveType');
 const LeaveRequest = require('../models/LeaveRequest');
 const { calculateLeaveDays } = require('../utils/dateUtils');
 const { isNonEmptyString, isPresent } = require('../utils/validators');
+const {
+  stripLeaveAuditFields,
+  getLeaveAuditPopulateOptions,
+} = require('../utils/auditUtils');
 
 const ACTIVE_LEAVE_STATUSES = ['PENDING', 'APPROVED'];
 
@@ -65,15 +69,7 @@ const resolveApprovedBy = (approvedBy) => {
   return approvedBy;
 };
 
-const getLeavePopulateOptions = () => {
-  const options = [{ path: 'employee' }, { path: 'leaveType' }];
-
-  if (mongoose.models.User) {
-    options.push({ path: 'approvedBy' });
-  }
-
-  return options;
-};
+const getLeavePopulateOptions = () => getLeaveAuditPopulateOptions();
 
 const populateLeaveRequest = async (leaveRequest) => {
   await leaveRequest.populate(getLeavePopulateOptions());
@@ -91,8 +87,9 @@ const hasOverlappingLeave = async (employeeId, fromDate, toDate) => {
   return Boolean(overlappingRequest);
 };
 
-const createLeaveRequest = async (data) => {
-  const { employee, leaveType, fromDate, toDate, reason } = data;
+const createLeaveRequest = async (data, createdBy) => {
+  const sanitized = stripLeaveAuditFields(data);
+  const { employee, leaveType, fromDate, toDate, reason } = sanitized;
 
   if (!isPresent(employee)) {
     throw createError('Employee is required', 400);
@@ -166,9 +163,10 @@ const createLeaveRequest = async (data) => {
     numberOfDays,
     reason,
     status: 'PENDING',
+    createdBy,
   });
 
-  return leaveRequest.populate(['employee', 'leaveType']);
+  return leaveRequest.populate(getLeavePopulateOptions());
 };
 
 const getLeaveRequests = async (query = {}) => {
@@ -308,41 +306,56 @@ const approveLeaveRequest = async (id, approvedBy) => {
     );
   }
 
-  leaveRequest.status = 'APPROVED';
-
   const resolvedApprovedBy = resolveApprovedBy(approvedBy);
 
   if (!resolvedApprovedBy) {
     throw createError('Approver is required', 401);
   }
 
+  leaveRequest.status = 'APPROVED';
   leaveRequest.approvedBy = resolvedApprovedBy;
+  leaveRequest.approvedAt = new Date();
+  leaveRequest.rejectedBy = null;
+  leaveRequest.rejectedAt = null;
+  leaveRequest.rejectionReason = null;
+  leaveRequest.rejectionRemark = null;
 
   await leaveRequest.save();
 
   return populateLeaveRequest(leaveRequest);
 };
 
-const rejectLeaveRequest = async (id, rejectionRemark) => {
+const rejectLeaveRequest = async (id, rejectionReason, rejectedBy) => {
   const leaveRequest = await findLeaveRequestById(id);
 
   ensurePendingStatus(leaveRequest);
 
-  const trimmedRemark = rejectionRemark?.trim();
+  const trimmedReason = rejectionReason?.trim();
 
-  if (!trimmedRemark) {
+  if (!trimmedReason) {
     throw createError('Rejection reason is required', 400);
   }
 
+  const resolvedRejectedBy = resolveApprovedBy(rejectedBy);
+
+  if (!resolvedRejectedBy) {
+    throw createError('Rejector is required', 401);
+  }
+
   leaveRequest.status = 'REJECTED';
-  leaveRequest.rejectionRemark = trimmedRemark;
+  leaveRequest.rejectionReason = trimmedReason;
+  leaveRequest.rejectionRemark = trimmedReason;
+  leaveRequest.rejectedBy = resolvedRejectedBy;
+  leaveRequest.rejectedAt = new Date();
+  leaveRequest.approvedBy = null;
+  leaveRequest.approvedAt = null;
 
   await leaveRequest.save();
 
   return populateLeaveRequest(leaveRequest);
 };
 
-const updateLeaveStatus = async (id, status, { approvedBy, rejectionReason } = {}) => {
+const updateLeaveStatus = async (id, status, { approvedBy, rejectedBy, rejectionReason } = {}) => {
   const normalizedStatus = typeof status === 'string' ? status.trim().toUpperCase() : '';
 
   if (normalizedStatus !== 'APPROVED' && normalizedStatus !== 'REJECTED') {
@@ -353,7 +366,7 @@ const updateLeaveStatus = async (id, status, { approvedBy, rejectionReason } = {
     return approveLeaveRequest(id, approvedBy);
   }
 
-  return rejectLeaveRequest(id, rejectionReason);
+  return rejectLeaveRequest(id, rejectionReason, rejectedBy);
 };
 
 module.exports = {

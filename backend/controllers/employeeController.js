@@ -4,26 +4,20 @@ const { handleError } = require('../middleware/errorMiddleware');
 
 const createEmployee = async (req, res) => {
   try {
-    const { employee, user } = await employeeService.createEmployee(req.body);
-
-    const message = user
-      ? 'Employee created and login account created successfully'
-      : 'Employee created successfully';
+    const { employee, user } = await employeeService.createEmployee(req.body, req.user._id);
 
     return res.status(201).json({
       success: true,
-      message,
+      message: 'Employee created and login account created successfully',
       data: {
         employee,
-        user: user
-          ? {
-              _id: user._id,
-              name: user.name,
-              email: user.email,
-              role: user.role,
-              employee: user.employee,
-            }
-          : null,
+        user: {
+          _id: user._id,
+          name: user.name,
+          email: user.email,
+          role: user.role,
+          employee: user.employee,
+        },
       },
     });
   } catch (error) {
@@ -61,12 +55,25 @@ const getEmployeeById = async (req, res) => {
 
 const updateEmployee = async (req, res) => {
   try {
-    const { employee, user } = await employeeService.updateEmployee(req.params.id, req.body);
+    const { employee, user, loginAccountNotFound } = await employeeService.updateEmployee(
+      req.params.id,
+      req.body,
+      req.user._id
+    );
+
+    if (loginAccountNotFound) {
+      return res.status(200).json({
+        success: true,
+        message:
+          'Employee updated successfully, but no login account was found to update the password',
+        data: { employee },
+      });
+    }
 
     if (user) {
       return res.status(200).json({
         success: true,
-        message: 'Employee updated and login account saved successfully',
+        message: 'Employee updated successfully',
         data: {
           employee,
           user: {
@@ -94,7 +101,17 @@ const formatStatusResponse = ({ employee, user }) => ({
   employee: {
     _id: employee._id,
     name: employee.name,
+    email: employee.email,
+    mobile: employee.mobile,
+    department: employee.department,
     status: employeeService.resolveStatus(employee.status),
+    isDeleted: Boolean(employee.isDeleted),
+    createdAt: employee.createdAt,
+    updatedAt: employee.updatedAt,
+    createdBy: employee.createdBy,
+    updatedBy: employee.updatedBy,
+    deletedAt: employee.deletedAt || null,
+    deletedBy: employee.deletedBy || null,
   },
   user: user
     ? {
@@ -108,11 +125,11 @@ const formatStatusResponse = ({ employee, user }) => ({
 
 const deleteEmployee = async (req, res) => {
   try {
-    const result = await employeeService.deleteEmployee(req.params.id);
+    const result = await employeeService.deleteEmployee(req.params.id, req.user._id);
 
     return res.status(200).json({
       success: true,
-      message: 'Employee deactivated successfully',
+      message: 'Employee deleted successfully',
       data: formatStatusResponse(result),
     });
   } catch (error) {
@@ -122,13 +139,31 @@ const deleteEmployee = async (req, res) => {
 
 const updateEmployeeStatus = async (req, res) => {
   try {
-    const result = await employeeService.updateEmployeeStatus(req.params.id, req.body.status);
+    const result = await employeeService.updateEmployeeStatus(
+      req.params.id,
+      req.body.status,
+      req.user._id
+    );
 
     const isActive = employeeService.resolveStatus(req.body.status) === 'ACTIVE';
 
     return res.status(200).json({
       success: true,
-      message: isActive ? 'Employee restored successfully' : 'Employee deactivated successfully',
+      message: isActive ? 'Employee activated successfully' : 'Employee deactivated successfully',
+      data: formatStatusResponse(result),
+    });
+  } catch (error) {
+    return handleError(res, error);
+  }
+};
+
+const restoreEmployee = async (req, res) => {
+  try {
+    const result = await employeeService.restoreEmployee(req.params.id, req.user._id);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Employee restored successfully',
       data: formatStatusResponse(result),
     });
   } catch (error) {
@@ -157,5 +192,6 @@ module.exports = {
   updateEmployee,
   deleteEmployee,
   updateEmployeeStatus,
+  restoreEmployee,
   updateEmployeeRole,
 };

@@ -5,13 +5,16 @@ const createLeaveRequest = async (req, res) => {
   try {
     const { employee, leaveType, fromDate, toDate, reason } = req.body;
 
-    const leaveRequest = await leaveService.createLeaveRequest({
-      employee,
-      leaveType,
-      fromDate,
-      toDate,
-      reason,
-    });
+    const leaveRequest = await leaveService.createLeaveRequest(
+      {
+        employee,
+        leaveType,
+        fromDate,
+        toDate,
+        reason,
+      },
+      req.user._id
+    );
 
     return res.status(201).json({
       success: true,
@@ -96,6 +99,7 @@ const updateLeaveStatus = async (req, res) => {
       status,
       {
         approvedBy: req.user._id,
+        rejectedBy: req.user._id,
         rejectionReason,
       }
     );

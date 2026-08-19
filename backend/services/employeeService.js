@@ -2,7 +2,19 @@ const mongoose = require('mongoose');
 const Employee = require('../models/Employee');
 const User = require('../models/User');
 const userService = require('./userService');
-const { isNonEmptyString, isValidEmail } = require('../utils/validators');
+const {
+  isPresent,
+  isValidEmail,
+  isValidEmployeeName,
+  isValidMobile,
+  isValidDepartment,
+  VALIDATION_MESSAGES,
+} = require('../utils/validators');
+const {
+  stripEmployeeAuditFields,
+  getEmployeeAuditPopulateOptions,
+  populateEmployeeAudit,
+} = require('../utils/auditUtils');
 
 const createError = (message, statusCode) => {
   const error = new Error(message);
@@ -14,8 +26,10 @@ const VALID_STATUSES = ['ACTIVE', 'INACTIVE'];
 
 const resolveStatus = (status) => status || 'ACTIVE';
 
+const isEmployeeDeleted = (employee) => Boolean(employee?.isDeleted);
+
 const buildStatusFilter = (statusParam) => {
-  const status = (statusParam || 'ACTIVE').toUpperCase();
+  const status = (statusParam || 'ALL').toUpperCase();
 
   if (status === 'ACTIVE') {
     return { $or: [{ status: 'ACTIVE' }, { status: { $exists: false } }] };
@@ -32,56 +46,111 @@ const buildStatusFilter = (statusParam) => {
   throw createError('Invalid status filter. Use ACTIVE, INACTIVE, or ALL', 400);
 };
 
-const syncEmployeeUserStatus = async (employee, status) => {
-  employee.status = status;
-  await employee.save();
+const buildNotDeletedFilter = () => ({
+  $or: [{ isDeleted: false }, { isDeleted: { $exists: false } }],
+});
 
-  const user = await User.findOne({ employee: employee._id });
+const syncUserStatus = async (employeeId, status) => {
+  const user = await User.findOne({ employee: employeeId });
 
   if (user) {
     user.status = status;
     await user.save();
   }
 
+  return user;
+};
+
+const syncEmployeeUserStatus = async (employee, status, { actorId } = {}) => {
+  employee.status = status;
+
+  if (actorId) {
+    employee.updatedBy = actorId;
+  }
+
+  await employee.save();
+  const user = await syncUserStatus(employee._id, status);
+
   return { employee, user };
 };
 
-const validateEmployeeInput = (data, { isUpdate = false, requireDepartment = true } = {}) => {
-  const requiredFields = [
-    { key: 'name', label: 'Name' },
-    { key: 'email', label: 'Email' },
-    { key: 'mobile', label: 'Mobile' },
-  ];
-
-  for (const field of requiredFields) {
-    if (isUpdate && data[field.key] === undefined) {
-      continue;
+const validateEmployeeName = (name, { required = false } = {}) => {
+  if (!isPresent(name)) {
+    if (required) {
+      throw createError('Name is required', 400);
     }
-
-    if (field.key === 'email') {
-      if (!isNonEmptyString(data.email)) {
-        throw createError('Email is required', 400);
-      }
-
-      if (!isValidEmail(data.email)) {
-        throw createError('Invalid email format', 400);
-      }
-
-      continue;
-    }
-
-    if (!isNonEmptyString(data[field.key])) {
-      throw createError(`${field.label} is required`, 400);
-    }
-  }
-
-  if (isUpdate && data.department === undefined) {
     return;
   }
 
-  if (requireDepartment && !isNonEmptyString(data.department)) {
-    throw createError('Department is required', 400);
+  if (!isValidEmployeeName(name)) {
+    throw createError(VALIDATION_MESSAGES.NAME, 400);
   }
+};
+
+const validateEmployeeEmail = (email, { required = false } = {}) => {
+  if (!isPresent(email)) {
+    if (required) {
+      throw createError(VALIDATION_MESSAGES.EMAIL_REQUIRED, 400);
+    }
+    return;
+  }
+
+  if (!isValidEmail(email)) {
+    throw createError(VALIDATION_MESSAGES.EMAIL_INVALID, 400);
+  }
+};
+
+const validateEmployeeMobile = (mobile, { required = false } = {}) => {
+  if (!isPresent(mobile)) {
+    if (required) {
+      throw createError(VALIDATION_MESSAGES.MOBILE_REQUIRED, 400);
+    }
+    return;
+  }
+
+  if (!isValidMobile(mobile)) {
+    throw createError(VALIDATION_MESSAGES.MOBILE_INVALID, 400);
+  }
+};
+
+const validateEmployeeDepartment = (department, { required = false } = {}) => {
+  if (!isPresent(department)) {
+    if (required) {
+      throw createError(VALIDATION_MESSAGES.DEPARTMENT_REQUIRED, 400);
+    }
+    return;
+  }
+
+  if (!isValidDepartment(department)) {
+    throw createError(VALIDATION_MESSAGES.DEPARTMENT_INVALID, 400);
+  }
+};
+
+const validateEmployeeInput = (data, { isUpdate = false } = {}) => {
+  if (isUpdate) {
+    if (data.name !== undefined) {
+      validateEmployeeName(data.name, { required: true });
+    }
+
+    if (data.email !== undefined) {
+      validateEmployeeEmail(data.email, { required: true });
+    }
+
+    if (data.mobile !== undefined) {
+      validateEmployeeMobile(data.mobile, { required: true });
+    }
+
+    if (data.department !== undefined) {
+      validateEmployeeDepartment(data.department, { required: true });
+    }
+
+    return;
+  }
+
+  validateEmployeeName(data.name, { required: true });
+  validateEmployeeEmail(data.email, { required: true });
+  validateEmployeeMobile(data.mobile, { required: true });
+  validateEmployeeDepartment(data.department, { required: true });
 };
 
 const buildEmployeePayload = (employeeData) => {
@@ -89,59 +158,88 @@ const buildEmployeePayload = (employeeData) => {
     name: employeeData.name.trim(),
     email: employeeData.email.trim().toLowerCase(),
     mobile: employeeData.mobile.trim(),
+    department: employeeData.department.trim(),
+    status: 'ACTIVE',
+    isDeleted: false,
+    deletedAt: null,
+    deletedBy: null,
   };
-
-  if (isNonEmptyString(employeeData.department)) {
-    payload.department = employeeData.department.trim();
-  }
 
   return payload;
 };
 
-const assertUniqueEmployeeEmail = async (email) => {
+const assertUniqueEmployeeEmail = async (email, excludeEmployeeId = null) => {
   const normalizedEmail = email.trim().toLowerCase();
-  const existingEmployee = await Employee.findOne({ email: normalizedEmail });
+  const employeeQuery = { email: normalizedEmail };
+
+  if (excludeEmployeeId) {
+    employeeQuery._id = { $ne: excludeEmployeeId };
+  }
+
+  const existingEmployee = await Employee.findOne(employeeQuery);
 
   if (existingEmployee) {
-    throw createError('Employee email already exists', 409);
+    throw createError('Email already exists', 409);
   }
 };
 
-const createEmployee = async (data) => {
-  const {
-    createUser = false,
-    role,
-    password,
-    ...employeeData
-  } = data;
+const assertUniqueUserEmail = async (email, excludeUserId = null) => {
+  const normalizedEmail = email.trim().toLowerCase();
+  const userQuery = { email: normalizedEmail };
 
-  let normalizedRole;
-
-  if (createUser) {
-    userService.validatePassword(password);
-    normalizedRole = userService.validateRoleValue(role);
+  if (excludeUserId) {
+    userQuery._id = { $ne: excludeUserId };
   }
 
-  const requireDepartment = !createUser || normalizedRole === 'EMPLOYEE';
+  const existingUser = await User.findOne(userQuery);
 
-  validateEmployeeInput(employeeData, { requireDepartment });
+  if (existingUser) {
+    throw createError('Email already exists', 409);
+  }
+};
+
+const assertUniqueMobile = async (mobile, excludeEmployeeId = null) => {
+  const normalizedMobile = mobile.trim();
+  const mobileQuery = { mobile: normalizedMobile };
+
+  if (excludeEmployeeId) {
+    mobileQuery._id = { $ne: excludeEmployeeId };
+  }
+
+  const existingEmployee = await Employee.findOne(mobileQuery);
+
+  if (existingEmployee) {
+    throw createError('Mobile number already exists', 409);
+  }
+};
+
+const validateCreateEmployeeInput = (data) => {
+  const sanitized = stripEmployeeAuditFields(data);
+  const { role, password, ...employeeData } = sanitized;
+
+  validateEmployeeInput(employeeData);
+  userService.validatePassword(password);
+
+  if (!isPresent(role)) {
+    throw createError(VALIDATION_MESSAGES.ROLE_REQUIRED, 400);
+  }
+
+  const normalizedRole = userService.validateRoleValue(role);
+
+  return { role: normalizedRole, password, employeeData };
+};
+
+const createEmployee = async (data, createdBy) => {
+  const { role, password, employeeData } = validateCreateEmployeeInput(data);
+
   await assertUniqueEmployeeEmail(employeeData.email);
+  await assertUniqueUserEmail(employeeData.email);
+  await assertUniqueMobile(employeeData.mobile);
 
-  if (createUser) {
-    const existingUser = await User.findOne({
-      email: employeeData.email.trim().toLowerCase(),
-    });
-
-    if (existingUser) {
-      throw createError('User email already exists', 409);
-    }
-  }
-
-  const employee = await Employee.create(buildEmployeePayload(employeeData));
-
-  if (!createUser) {
-    return { employee, user: null };
-  }
+  const employee = await Employee.create({
+    ...buildEmployeePayload(employeeData),
+    createdBy,
+  });
 
   try {
     const user = await userService.createUserAccount({
@@ -152,6 +250,8 @@ const createEmployee = async (data) => {
       employeeId: employee._id,
     });
 
+    await populateEmployeeAudit(employee);
+
     return { employee, user };
   } catch (error) {
     await Employee.findByIdAndDelete(employee._id);
@@ -159,16 +259,25 @@ const createEmployee = async (data) => {
   }
 };
 
+const isDeletedListRequested = (query = {}) => {
+  const value = String(query.deleted ?? query.isDeleted ?? '').toLowerCase();
+  return ['true', '1', 'yes'].includes(value);
+};
+
 const getEmployees = async (query = {}) => {
   const page = Math.max(parseInt(query.page, 10) || 1, 1);
   const limit = Math.max(parseInt(query.limit, 10) || 10, 1);
   const skip = (page - 1) * limit;
+  const showDeleted = isDeletedListRequested(query);
 
-  const andConditions = [];
-  const statusFilter = buildStatusFilter(query.status);
+  const andConditions = [showDeleted ? { isDeleted: true } : buildNotDeletedFilter()];
 
-  if (statusFilter) {
-    andConditions.push(statusFilter);
+  if (!showDeleted) {
+    const statusFilter = buildStatusFilter(query.status);
+
+    if (statusFilter) {
+      andConditions.push(statusFilter);
+    }
   }
 
   if (query.search) {
@@ -179,7 +288,11 @@ const getEmployees = async (query = {}) => {
   const filter = andConditions.length ? { $and: andConditions } : {};
 
   const [employees, total] = await Promise.all([
-    Employee.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit),
+    Employee.find(filter)
+      .populate(getEmployeeAuditPopulateOptions())
+      .sort(showDeleted ? { deletedAt: -1 } : { createdAt: -1 })
+      .skip(skip)
+      .limit(limit),
     Employee.countDocuments(filter),
   ]);
 
@@ -199,7 +312,7 @@ const getEmployeeById = async (id) => {
     throw createError('Employee not found', 404);
   }
 
-  const employee = await Employee.findById(id);
+  const employee = await Employee.findById(id).populate(getEmployeeAuditPopulateOptions());
 
   if (!employee) {
     throw createError('Employee not found', 404);
@@ -230,25 +343,41 @@ const buildEmployeeUpdatePayload = (employeeData) => {
   return payload;
 };
 
-const updateEmployee = async (id, data) => {
+const updateEmployee = async (id, data, updatedBy) => {
   if (!mongoose.Types.ObjectId.isValid(id)) {
     throw createError('Employee not found', 404);
   }
+
+  const sanitized = stripEmployeeAuditFields(data);
 
   const {
     createUser = false,
     role,
     password,
     ...employeeData
-  } = data;
+  } = sanitized;
 
   validateEmployeeInput(employeeData, { isUpdate: true });
 
-  const updatePayload = buildEmployeeUpdatePayload(employeeData);
+  if (employeeData.email !== undefined) {
+    await assertUniqueEmployeeEmail(employeeData.email, id);
+
+    const linkedUser = await User.findOne({ employee: id });
+    await assertUniqueUserEmail(employeeData.email, linkedUser?._id);
+  }
+
+  if (employeeData.mobile !== undefined) {
+    await assertUniqueMobile(employeeData.mobile, id);
+  }
+
+  const updatePayload = {
+    ...buildEmployeeUpdatePayload(employeeData),
+    updatedBy,
+  };
 
   const employee = await Employee.findByIdAndUpdate(
     id,
-    Object.keys(updatePayload).length ? updatePayload : {},
+    updatePayload,
     {
       new: true,
       runValidators: true,
@@ -260,6 +389,7 @@ const updateEmployee = async (id, data) => {
   }
 
   let user = null;
+  let loginAccountNotFound = false;
 
   if (createUser) {
     user = await userService.createOrUpdateUserForEmployee({
@@ -267,12 +397,20 @@ const updateEmployee = async (id, data) => {
       password,
       role,
     });
+  } else if (password !== undefined && password !== null && String(password).trim() !== '') {
+    user = await userService.updateUserPasswordByEmployeeId(employee._id, password);
+
+    if (!user) {
+      loginAccountNotFound = true;
+    }
   }
 
-  return { employee, user };
+  await populateEmployeeAudit(employee);
+
+  return { employee, user, loginAccountNotFound };
 };
 
-const deleteEmployee = async (id) => {
+const deleteEmployee = async (id, actorId) => {
   if (!mongoose.Types.ObjectId.isValid(id)) {
     throw createError('Employee not found', 404);
   }
@@ -283,10 +421,24 @@ const deleteEmployee = async (id) => {
     throw createError('Employee not found', 404);
   }
 
-  return syncEmployeeUserStatus(employee, 'INACTIVE');
+  if (isEmployeeDeleted(employee)) {
+    throw createError('Employee is already deleted', 400);
+  }
+
+  employee.isDeleted = true;
+  employee.status = 'INACTIVE';
+  employee.deletedAt = new Date();
+  employee.deletedBy = actorId;
+  employee.updatedBy = actorId;
+  await employee.save();
+
+  const user = await syncUserStatus(employee._id, 'INACTIVE');
+  await populateEmployeeAudit(employee);
+
+  return { employee, user };
 };
 
-const updateEmployeeStatus = async (id, status) => {
+const updateEmployeeStatus = async (id, status, actorId) => {
   if (!mongoose.Types.ObjectId.isValid(id)) {
     throw createError('Employee not found', 404);
   }
@@ -303,7 +455,49 @@ const updateEmployeeStatus = async (id, status) => {
     throw createError('Employee not found', 404);
   }
 
-  return syncEmployeeUserStatus(employee, normalizedStatus);
+  if (isEmployeeDeleted(employee)) {
+    throw createError('Cannot change status of a deleted employee', 400);
+  }
+
+  const result = await syncEmployeeUserStatus(employee, normalizedStatus, { actorId });
+  await populateEmployeeAudit(result.employee);
+
+  return result;
+};
+
+const restoreEmployee = async (id, actorId) => {
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    throw createError('Employee not found', 404);
+  }
+
+  const existing = await Employee.findById(id);
+
+  if (!existing) {
+    throw createError('Employee not found', 404);
+  }
+
+  if (!isEmployeeDeleted(existing)) {
+    throw createError('Employee is not deleted', 400);
+  }
+
+  const employee = await Employee.findByIdAndUpdate(
+    id,
+    {
+      $set: {
+        status: 'ACTIVE',
+        isDeleted: false,
+        deletedBy: null,
+        deletedAt: null,
+        updatedBy: actorId,
+      },
+    },
+    { new: true, runValidators: true }
+  );
+
+  const user = await syncUserStatus(employee._id, 'ACTIVE');
+  await populateEmployeeAudit(employee);
+
+  return { employee, user };
 };
 
 module.exports = {
@@ -313,5 +507,6 @@ module.exports = {
   updateEmployee,
   deleteEmployee,
   updateEmployeeStatus,
+  restoreEmployee,
   resolveStatus,
 };

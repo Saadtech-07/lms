@@ -6,8 +6,11 @@ const {
   isNonEmptyString,
   isValidEmail,
   isValidRole,
+  isValidPassword,
+  isValidEmployeeName,
   normalizeRole,
   isPresent,
+  VALIDATION_MESSAGES,
 } = require('../utils/validators');
 
 const createError = (message, statusCode) => {
@@ -18,13 +21,21 @@ const createError = (message, statusCode) => {
 
 const validatePassword = (password) => {
   if (!isNonEmptyString(password)) {
-    throw createError('Password is required', 400);
+    throw createError(VALIDATION_MESSAGES.PASSWORD_REQUIRED, 400);
+  }
+
+  if (!isValidPassword(password)) {
+    throw createError(VALIDATION_MESSAGES.PASSWORD_STRENGTH, 400);
   }
 };
 
 const validateRoleValue = (role) => {
+  if (!isPresent(role)) {
+    throw createError(VALIDATION_MESSAGES.ROLE_REQUIRED, 400);
+  }
+
   if (!isValidRole(role)) {
-    throw createError('Invalid role. Allowed values: ADMIN, MANAGER, EMPLOYEE', 400);
+    throw createError(VALIDATION_MESSAGES.ROLE_INVALID, 400);
   }
 
   return normalizeRole(role);
@@ -46,12 +57,18 @@ const assertEmployeeExists = async (employeeId) => {
   return employee;
 };
 
-const assertUniqueUserEmail = async (email) => {
+const assertUniqueUserEmail = async (email, excludeUserId = null) => {
   const normalizedEmail = email.trim().toLowerCase();
-  const existingUser = await User.findOne({ email: normalizedEmail });
+  const userQuery = { email: normalizedEmail };
+
+  if (excludeUserId) {
+    userQuery._id = { $ne: excludeUserId };
+  }
+
+  const existingUser = await User.findOne(userQuery);
 
   if (existingUser) {
-    throw createError('User email already exists', 409);
+    throw createError('Email already exists', 409);
   }
 };
 
@@ -68,8 +85,12 @@ const createUserAccount = async ({ name, email, password, role, employeeId }) =>
     throw createError('Name is required', 400);
   }
 
+  if (!isValidEmployeeName(name)) {
+    throw createError(VALIDATION_MESSAGES.NAME, 400);
+  }
+
   if (!isValidEmail(email)) {
-    throw createError('Invalid email format', 400);
+    throw createError(VALIDATION_MESSAGES.EMAIL_INVALID, 400);
   }
 
   validatePassword(password);
@@ -129,7 +150,7 @@ const createOrUpdateUserForEmployee = async ({ employee, password, role }) => {
     existingUser.employee &&
     existingUser.employee.toString() !== employee._id.toString()
   ) {
-    throw createError('User email already exists', 409);
+    throw createError('Email already exists', 409);
   }
 
   if (role !== undefined) {
@@ -148,6 +169,21 @@ const createOrUpdateUserForEmployee = async ({ employee, password, role }) => {
   await existingUser.save();
 
   return existingUser;
+};
+
+const updateUserPasswordByEmployeeId = async (employeeId, password) => {
+  validatePassword(password);
+
+  const user = await User.findOne({ employee: employeeId });
+
+  if (!user) {
+    return null;
+  }
+
+  user.password = await hashPassword(password);
+  await user.save();
+
+  return user;
 };
 
 const updateUserRoleByEmployeeId = async (employeeId, role) => {
@@ -186,6 +222,7 @@ module.exports = {
   createUserAccount,
   createUserForEmployee,
   createOrUpdateUserForEmployee,
+  updateUserPasswordByEmployeeId,
   updateUserRoleByEmployeeId,
   validatePassword,
   validateRoleValue,
