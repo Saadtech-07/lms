@@ -2,6 +2,7 @@ const express = require('express');
 const {
   createEmployee,
   getEmployees,
+  getEmployeeDepartments,
   getEmployeeById,
   updateEmployee,
   deleteEmployee,
@@ -16,6 +17,7 @@ const router = express.Router();
 
 router.post('/', authMiddleware, authorizeRoles('ADMIN'), createEmployee);
 router.get('/', authMiddleware, authorizeRoles('ADMIN', 'MANAGER'), getEmployees);
+router.get('/departments', authMiddleware, authorizeRoles('ADMIN', 'MANAGER'), getEmployeeDepartments);
 router.patch('/:id/role', authMiddleware, authorizeRoles('ADMIN'), updateEmployeeRole);
 router.patch('/:id/status', authMiddleware, authorizeRoles('ADMIN', 'MANAGER'), updateEmployeeStatus);
 router.patch('/:id/restore', authMiddleware, authorizeRoles('ADMIN', 'MANAGER'), restoreEmployee);

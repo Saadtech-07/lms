@@ -2,12 +2,22 @@ const mongoose = require('mongoose');
 const Employee = require('../models/Employee');
 const LeaveType = require('../models/LeaveType');
 const LeaveRequest = require('../models/LeaveRequest');
-const { calculateLeaveDays } = require('../utils/dateUtils');
+const {
+  calculateWorkingDays,
+  validateEmployeeLeaveDates,
+  parseDateInput,
+  toDateInputValue,
+} = require('../utils/dateUtils');
 const { isNonEmptyString, isPresent } = require('../utils/validators');
 const {
   stripLeaveAuditFields,
   getLeaveAuditPopulateOptions,
 } = require('../utils/auditUtils');
+const {
+  buildExactMatchRegex,
+  buildSearchRegex,
+  isAllFilterValue,
+} = require('../utils/queryUtils');
 
 const ACTIVE_LEAVE_STATUSES = ['PENDING', 'APPROVED'];
 
@@ -71,23 +81,92 @@ const resolveApprovedBy = (approvedBy) => {
 
 const getLeavePopulateOptions = () => getLeaveAuditPopulateOptions();
 
+const buildEmployeeMatchFilter = ({ search, department } = {}) => {
+  const conditions = [];
+
+  if (!isAllFilterValue(department)) {
+    const departmentRegex = buildExactMatchRegex(department);
+
+    if (departmentRegex) {
+      conditions.push({ department: departmentRegex });
+    }
+  }
+
+  if (search) {
+    const searchRegex = buildSearchRegex(search);
+
+    if (searchRegex) {
+      conditions.push({ $or: [{ name: searchRegex }, { email: searchRegex }] });
+    }
+  }
+
+  if (!conditions.length) {
+    return null;
+  }
+
+  return conditions.length === 1 ? conditions[0] : { $and: conditions };
+};
+
+const resolveEmployeeIdsForLeaveFilter = async ({ search, department } = {}) => {
+  const employeeMatch = buildEmployeeMatchFilter({ search, department });
+
+  if (!employeeMatch) {
+    return null;
+  }
+
+  const employees = await Employee.find(employeeMatch).select('_id');
+  return employees.map((employee) => employee._id);
+};
+
+const resolveLeaveTypeFilter = async (leaveTypeParam) => {
+  if (isAllFilterValue(leaveTypeParam) || !leaveTypeParam) {
+    return null;
+  }
+
+  if (mongoose.Types.ObjectId.isValid(leaveTypeParam)) {
+    return leaveTypeParam;
+  }
+
+  const leaveTypeRegex = buildExactMatchRegex(leaveTypeParam);
+  const leaveTypeDoc = await LeaveType.findOne({ name: leaveTypeRegex }).select('_id');
+
+  return leaveTypeDoc?._id || null;
+};
+
+const buildEmptyLeaveListResult = (page, limit) => ({
+  leaveRequests: [],
+  pagination: {
+    page,
+    limit,
+    total: 0,
+    totalPages: 1,
+  },
+});
+
 const populateLeaveRequest = async (leaveRequest) => {
   await leaveRequest.populate(getLeavePopulateOptions());
   return leaveRequest;
 };
 
-const hasOverlappingLeave = async (employeeId, fromDate, toDate) => {
-  const overlappingRequest = await LeaveRequest.findOne({
+const findOverlappingLeave = async (employeeId, fromDate, toDate, excludeRequestId = null) => {
+  const normalizedFrom = parseDateInput(fromDate);
+  const normalizedTo = parseDateInput(toDate);
+
+  const filter = {
     employee: employeeId,
     status: { $in: ACTIVE_LEAVE_STATUSES },
-    fromDate: { $lte: new Date(toDate) },
-    toDate: { $gte: new Date(fromDate) },
-  });
+    fromDate: { $lte: normalizedTo },
+    toDate: { $gte: normalizedFrom },
+  };
 
-  return Boolean(overlappingRequest);
+  if (excludeRequestId) {
+    filter._id = { $ne: excludeRequestId };
+  }
+
+  return LeaveRequest.findOne(filter).populate('leaveType', 'name');
 };
 
-const createLeaveRequest = async (data, createdBy) => {
+const createLeaveRequest = async (data, createdBy, user = {}) => {
   const sanitized = stripLeaveAuditFields(data);
   const { employee, leaveType, fromDate, toDate, reason } = sanitized;
 
@@ -131,10 +210,21 @@ const createLeaveRequest = async (data, createdBy) => {
     throw createError('Leave type is not active', 400);
   }
 
+  const normalizedFromDate = parseDateInput(fromDate);
+  const normalizedToDate = parseDateInput(toDate);
+
   let numberOfDays;
 
   try {
-    numberOfDays = calculateLeaveDays(fromDate, toDate);
+    if (user.role === 'EMPLOYEE') {
+      numberOfDays = validateEmployeeLeaveDates(normalizedFromDate, normalizedToDate);
+    } else {
+      numberOfDays = calculateWorkingDays(normalizedFromDate, normalizedToDate);
+
+      if (numberOfDays < 1) {
+        throw new Error('Leave must include at least one working day');
+      }
+    }
   } catch (error) {
     throw createError(error.message, 400);
   }
@@ -149,17 +239,28 @@ const createLeaveRequest = async (data, createdBy) => {
     );
   }
 
-  const overlapping = await hasOverlappingLeave(employee, fromDate, toDate);
+  const overlappingRequest = await findOverlappingLeave(
+    employee,
+    normalizedFromDate,
+    normalizedToDate
+  );
 
-  if (overlapping) {
-    throw createError('Leave request overlaps with an existing leave request', 400);
+  if (overlappingRequest) {
+    const existingFrom = toDateInputValue(overlappingRequest.fromDate);
+    const existingTo = toDateInputValue(overlappingRequest.toDate);
+    const leaveTypeName = overlappingRequest.leaveType?.name || 'leave';
+
+    throw createError(
+      `These dates overlap with your existing ${overlappingRequest.status.toLowerCase()} ${leaveTypeName} request (${existingFrom} to ${existingTo}). Choose different dates.`,
+      400
+    );
   }
 
   const leaveRequest = await LeaveRequest.create({
     employee,
     leaveType,
-    fromDate,
-    toDate,
+    fromDate: normalizedFromDate,
+    toDate: normalizedToDate,
     numberOfDays,
     reason,
     status: 'PENDING',
@@ -180,16 +281,39 @@ const getLeaveRequests = async (query = {}) => {
     filter.employee = query.employee;
   }
 
-  if (query.status) {
+  if (query.status && !isAllFilterValue(query.status)) {
     filter.status = query.status.toUpperCase();
   }
 
-  if (query.leaveType && mongoose.Types.ObjectId.isValid(query.leaveType)) {
-    filter.leaveType = query.leaveType;
+  const leaveTypeFilter = await resolveLeaveTypeFilter(query.leaveType);
+
+  if (query.leaveType && !isAllFilterValue(query.leaveType) && !leaveTypeFilter) {
+    return buildEmptyLeaveListResult(page, limit);
   }
 
-  if (query.search) {
-    filter.reason = new RegExp(query.search.trim(), 'i');
+  if (leaveTypeFilter) {
+    filter.leaveType = leaveTypeFilter;
+  }
+
+  const employeeIds = await resolveEmployeeIdsForLeaveFilter({
+    search: query.search,
+    department: query.department,
+  });
+
+  if (employeeIds) {
+    if (!employeeIds.length) {
+      return buildEmptyLeaveListResult(page, limit);
+    }
+
+    if (filter.employee) {
+      const requestedEmployeeId = String(filter.employee);
+
+      if (!employeeIds.some((employeeId) => String(employeeId) === requestedEmployeeId)) {
+        return buildEmptyLeaveListResult(page, limit);
+      }
+    } else {
+      filter.employee = { $in: employeeIds };
+    }
   }
 
   const [leaveRequests, total] = await Promise.all([

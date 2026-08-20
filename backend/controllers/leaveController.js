@@ -3,7 +3,19 @@ const { handleError } = require('../middleware/errorMiddleware');
 
 const createLeaveRequest = async (req, res) => {
   try {
-    const { employee, leaveType, fromDate, toDate, reason } = req.body;
+    let { employee, leaveType, fromDate, toDate, reason } = req.body;
+
+    if (req.user.role === 'EMPLOYEE') {
+      if (!req.user.employee) {
+        return res.status(403).json({
+          success: false,
+          message: 'Employee profile not linked to user account',
+          data: null,
+        });
+      }
+
+      employee = req.user.employee;
+    }
 
     const leaveRequest = await leaveService.createLeaveRequest(
       {
@@ -13,7 +25,8 @@ const createLeaveRequest = async (req, res) => {
         toDate,
         reason,
       },
-      req.user._id
+      req.user._id,
+      req.user
     );
 
     return res.status(201).json({
@@ -28,12 +41,13 @@ const createLeaveRequest = async (req, res) => {
 
 const getLeaveRequests = async (req, res) => {
   try {
-    const { employee, status, leaveType, page, limit, search } = req.query;
+    const { employee, status, leaveType, department, page, limit, search } = req.query;
 
     const result = await leaveService.getLeaveRequests({
       employee,
       status,
       leaveType,
+      department,
       page,
       limit,
       search,

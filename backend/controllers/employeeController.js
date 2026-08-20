@@ -39,6 +39,20 @@ const getEmployees = async (req, res) => {
   }
 };
 
+const getEmployeeDepartments = async (req, res) => {
+  try {
+    const departments = await employeeService.getEmployeeDepartments();
+
+    return res.status(200).json({
+      success: true,
+      message: 'Employee departments fetched successfully',
+      data: departments,
+    });
+  } catch (error) {
+    return handleError(res, error);
+  }
+};
+
 const getEmployeeById = async (req, res) => {
   try {
     const employee = await employeeService.getEmployeeById(req.params.id);
@@ -188,6 +202,7 @@ const updateEmployeeRole = async (req, res) => {
 module.exports = {
   createEmployee,
   getEmployees,
+  getEmployeeDepartments,
   getEmployeeById,
   updateEmployee,
   deleteEmployee,

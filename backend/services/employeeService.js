@@ -15,6 +15,11 @@ const {
   getEmployeeAuditPopulateOptions,
   populateEmployeeAudit,
 } = require('../utils/auditUtils');
+const {
+  buildExactMatchRegex,
+  buildSearchRegex,
+  isAllFilterValue,
+} = require('../utils/queryUtils');
 
 const createError = (message, statusCode) => {
   const error = new Error(message);
@@ -281,8 +286,19 @@ const getEmployees = async (query = {}) => {
   }
 
   if (query.search) {
-    const searchRegex = new RegExp(query.search.trim(), 'i');
-    andConditions.push({ $or: [{ name: searchRegex }, { email: searchRegex }] });
+    const searchRegex = buildSearchRegex(query.search);
+
+    if (searchRegex) {
+      andConditions.push({ $or: [{ name: searchRegex }, { email: searchRegex }] });
+    }
+  }
+
+  if (!isAllFilterValue(query.department)) {
+    const departmentRegex = buildExactMatchRegex(query.department);
+
+    if (departmentRegex) {
+      andConditions.push({ department: departmentRegex });
+    }
   }
 
   const filter = andConditions.length ? { $and: andConditions } : {};
@@ -465,6 +481,20 @@ const updateEmployeeStatus = async (id, status, actorId) => {
   return result;
 };
 
+const getEmployeeDepartments = async () => {
+  const departments = await Employee.distinct('department', {
+    $and: [
+      buildNotDeletedFilter(),
+      { department: { $exists: true, $nin: [null, ''] } },
+    ],
+  });
+
+  return departments
+    .map((department) => String(department).trim())
+    .filter(Boolean)
+    .sort((left, right) => left.localeCompare(right));
+};
+
 const restoreEmployee = async (id, actorId) => {
   if (!mongoose.Types.ObjectId.isValid(id)) {
     throw createError('Employee not found', 404);
@@ -503,6 +533,7 @@ const restoreEmployee = async (id, actorId) => {
 module.exports = {
   createEmployee,
   getEmployees,
+  getEmployeeDepartments,
   getEmployeeById,
   updateEmployee,
   deleteEmployee,
