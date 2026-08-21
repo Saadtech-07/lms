@@ -1,8 +1,22 @@
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Test output
+test-results/
+playwright-report/
+blob-report/
 
 # Playwright
-node_modules/
-/test-results/
-/playwright-report/
-/blob-report/
-/playwright/.cache/
-/playwright/.auth/
+playwright/.cache/
+playwright/.auth/
+
+# Next.js
+.next/
